@@ -34,6 +34,7 @@
 #include <QtGui/QGuiApplication>
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
+#include <thread>
 
 #ifdef HAVE_QT_QPA_HEADER
 #include <qpa/qplatformnativeinterface.h>
@@ -64,6 +65,7 @@ enum
 struct _QtGLVideoItemPrivate
 {
   GMutex lock;
+  GMutex buffer_lock;
 
   /* properties */
   gboolean force_aspect_ratio;
@@ -73,7 +75,9 @@ struct _QtGLVideoItemPrivate
   gint display_height;
 
   gboolean negotiated;
-  GstBuffer *buffer;
+  GstBuffer *front_buffer;
+  GstBuffer *back_buffer;
+  gboolean waiting_on_render;
   GstCaps *caps;
   GstVideoInfo v_info;
 
@@ -188,37 +192,37 @@ QtGLVideoItem::itemInitialized()
   return m_openGlContextInitialized;
 }
 
-QSGNode *
-QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
-    UpdatePaintNodeData * updatePaintNodeData)
+QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
+                                        UpdatePaintNodeData* updatePaintNodeData)
 {
   if (!m_openGlContextInitialized) {
     return oldNode;
   }
 
-  QSGSimpleTextureNode *texNode = static_cast<QSGSimpleTextureNode *> (oldNode);
+  QSGSimpleTextureNode* texNode = static_cast<QSGSimpleTextureNode*>(oldNode);
   GstVideoRectangle src, dst, result;
   GstQSGTexture *tex;
 
-  g_mutex_lock (&this->priv->lock);
-  gst_gl_context_activate (this->priv->other_context, TRUE);
-
-  GST_TRACE ("%p updatePaintNode", this);
-
+  g_mutex_lock(&this->priv->lock);
   if (!this->priv->caps) {
-    g_mutex_unlock (&this->priv->lock);
-    return NULL;
+      g_mutex_unlock(&this->priv->lock);
+      return NULL;
   }
 
+  g_mutex_lock(&this->priv->buffer_lock);
+  std::swap(this->priv->front_buffer, this->priv->back_buffer);
+  g_mutex_unlock(&this->priv->buffer_lock);
+
+  gst_gl_context_activate(this->priv->other_context, TRUE);
   if (!texNode) {
-    texNode = new QSGSimpleTextureNode ();
-    texNode->setOwnsTexture (true);
-    texNode->setTexture (new GstQSGTexture ());
+    texNode = new QSGSimpleTextureNode();
+    texNode->setOwnsTexture(true);
+    texNode->setTexture(new GstQSGTexture());
   }
 
-  tex = static_cast<GstQSGTexture *> (texNode->texture());
-  tex->setCaps (this->priv->caps);
-  tex->setBuffer (this->priv->buffer);
+  tex = static_cast<GstQSGTexture*>(texNode->texture());
+  tex->setCaps(this->priv->caps);
+  tex->setBuffer(this->priv->front_buffer);
   texNode->markDirty(QSGNode::DirtyMaterial);
 
   if (this->priv->force_aspect_ratio) {
@@ -230,7 +234,7 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
     dst.w = boundingRect().width();
     dst.h = boundingRect().height();
 
-    gst_video_sink_center_rect (src, dst, &result, TRUE);
+    gst_video_sink_center_rect(src, dst, &result, TRUE);
   } else {
     result.x = boundingRect().x();
     result.y = boundingRect().y();
@@ -238,27 +242,28 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
     result.h = boundingRect().height();
   }
 
-  texNode->setRect (QRectF (result.x, result.y, result.w, result.h));
+  texNode->setRect(QRectF(result.x, result.y, result.w, result.h));
 
-  gst_gl_context_activate (this->priv->other_context, FALSE);
-  g_mutex_unlock (&this->priv->lock);
+  gst_gl_context_activate(this->priv->other_context, FALSE);
+  this->priv->waiting_on_render = false;
+  g_mutex_unlock(&this->priv->lock);
 
   return texNode;
 }
 
-static void
-_reset (QtGLVideoItem * qt_item)
+static void _reset(QtGLVideoItem * qt_item)
 {
-  gst_buffer_replace (&qt_item->priv->buffer, NULL);
+  gst_buffer_replace(&qt_item->priv->back_buffer, NULL);
+  gst_buffer_replace(&qt_item->priv->front_buffer, NULL);
 
-  gst_caps_replace (&qt_item->priv->caps, NULL);
+  gst_caps_replace(&qt_item->priv->caps, NULL);
 
   qt_item->priv->negotiated = FALSE;
   qt_item->priv->initted = FALSE;
+  qt_item->priv->waiting_on_render = FALSE;
 }
 
-void
-QtGLVideoItemInterface::setBuffer (GstBuffer * buffer)
+void QtGLVideoItemInterface::setBuffer(GstBuffer * buffer)
 {
   QMutexLocker locker(&lock);
 
@@ -270,14 +275,22 @@ QtGLVideoItemInterface::setBuffer (GstBuffer * buffer)
     return;
   }
 
-  g_mutex_lock (&qt_item->priv->lock);
+  g_mutex_lock(&qt_item->priv->buffer_lock);
+  gst_buffer_replace(&qt_item->priv->back_buffer, buffer);
+  qt_item->priv->waiting_on_render = true;
+  g_mutex_unlock(&qt_item->priv->buffer_lock);
 
-  gst_buffer_replace (&qt_item->priv->buffer, buffer);
+  // queue buffer and wait until it finishes rendering
+  // this wait is important when our device is too slow to render and decode frames
+  // so that the pipeline can use its queue element to drop frames as required
+  QMetaObject::invokeMethod(qt_item, "update", Qt::BlockingQueuedConnection);
 
-  QMetaObject::invokeMethod(qt_item, "update", Qt::QueuedConnection);
-
-  g_mutex_unlock (&qt_item->priv->lock);
+  while (qt_item->priv->waiting_on_render) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
 }
+
+/////////////////////////////////////////////////////////////////////
 
 void
 QtGLVideoItem::onSceneGraphInitialized ()

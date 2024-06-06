@@ -35,6 +35,7 @@
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
 #include <thread>
+#include <mutex> // lock_guard
 
 #ifdef HAVE_QT_QPA_HEADER
 #include <qpa/qplatformnativeinterface.h>
@@ -62,10 +63,23 @@ enum
   PROP_PIXEL_ASPECT_RATIO,
 };
 
+struct SmartGMutex
+{
+  GMutex mtx;
+  SmartGMutex() { g_mutex_init(&mtx); }
+  ~SmartGMutex() { g_mutex_clear(&mtx); }
+  void lock() { g_mutex_lock(&mtx); }
+  void unlock() { g_mutex_unlock(&mtx); }
+  SmartGMutex(const SmartGMutex&) = delete;
+  SmartGMutex& operator=(const SmartGMutex&) = delete;
+  SmartGMutex(SmartGMutex&&) = delete;
+  SmartGMutex& operator=(SmartGMutex&&) = delete;
+};
+
 struct _QtGLVideoItemPrivate
 {
-  GMutex lock;
-  GMutex buffer_lock;
+  SmartGMutex lock;
+  SmartGMutex buffer_lock;
 
   /* properties */
   gboolean force_aspect_ratio;
@@ -116,23 +130,19 @@ QtGLVideoItem::QtGLVideoItem()
     GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, "qtglwidget", 0, "Qt GL Widget");
     g_once_init_leave (&_debug, 1);
   }
-  this->m_openGlContextInitialized = false;
-  this->setFlag (QQuickItem::ItemHasContents, true);
+  m_openGlContextInitialized = false;
+  setFlag(QQuickItem::ItemHasContents, true);
 
-  this->priv = g_new0 (QtGLVideoItemPrivate, 1);
-
-  this->priv->force_aspect_ratio = DEFAULT_FORCE_ASPECT_RATIO;
-  this->priv->par_n = DEFAULT_PAR_N;
-  this->priv->par_d = DEFAULT_PAR_D;
-
-  g_mutex_init (&this->priv->lock);
-
-  this->priv->display = gst_qt_get_gl_display();
+  priv = QSharedPointer<QtGLVideoItemPrivate>(new QtGLVideoItemPrivate{});
+  priv->force_aspect_ratio = DEFAULT_FORCE_ASPECT_RATIO;
+  priv->par_n = DEFAULT_PAR_N;
+  priv->par_d = DEFAULT_PAR_D;
+  priv->display = gst_qt_get_gl_display();
 
   connect(this, SIGNAL(windowChanged(QQuickWindow*)), this,
           SLOT(handleWindowChanged(QQuickWindow*)));
 
-  this->proxy = QSharedPointer<QtGLVideoItemInterface>(new QtGLVideoItemInterface(this));
+  proxy = QSharedPointer<QtGLVideoItemInterface>(new QtGLVideoItemInterface(this));
 
   GST_DEBUG ("%p init Qt Video Item", this);
 }
@@ -143,51 +153,39 @@ QtGLVideoItem::~QtGLVideoItem()
    * no qmlglsink's will call in again, and that
    * any ongoing calls are done by invalidating the proxy
    * pointer */
-  GST_INFO ("Destroying QtGLVideoItem and invalidating the proxy");
+  GST_INFO("Destroying QtGLVideoItem and invalidating the proxy");
   proxy.clear(); // call QtGLVideoItemInterface destructor
 
-  g_mutex_clear(&this->priv->lock);
-  g_mutex_clear(&this->priv->buffer_lock);
-  if (this->priv->context)
-    gst_object_unref(this->priv->context);
-  if (this->priv->other_context)
-    gst_object_unref(this->priv->other_context);
-  if (this->priv->display)
-    gst_object_unref(this->priv->display);
-  g_free(this->priv);
-  this->priv = NULL;
+  if (priv->context) gst_object_unref(priv->context);
+  if (priv->other_context) gst_object_unref(priv->other_context);
+  if (priv->display) gst_object_unref(priv->display);
+
+  priv.clear(); // call QtGLVideoItemPrivate destructor
 }
 
-void
-QtGLVideoItem::setDAR(gint num, gint den)
+void QtGLVideoItem::setDAR(gint num, gint den)
 {
-  this->priv->par_n = num;
-  this->priv->par_d = den;
+  priv->par_n = num;
+  priv->par_d = den;
 }
 
-void
-QtGLVideoItem::getDAR(gint * num, gint * den)
+void QtGLVideoItem::getDAR(gint * num, gint * den)
 {
-  if (num)
-    *num = this->priv->par_n;
-  if (den)
-    *den = this->priv->par_d;
+  if (num) *num = priv->par_n;
+  if (den) *den = priv->par_d;
 }
 
-void
-QtGLVideoItem::setForceAspectRatio(bool force_aspect_ratio)
+void QtGLVideoItem::setForceAspectRatio(bool force_aspect_ratio)
 {
-  this->priv->force_aspect_ratio = !!force_aspect_ratio;
+  priv->force_aspect_ratio = !!force_aspect_ratio;
 }
 
-bool
-QtGLVideoItem::getForceAspectRatio()
+bool QtGLVideoItem::getForceAspectRatio()
 {
-  return this->priv->force_aspect_ratio;
+  return priv->force_aspect_ratio;
 }
 
-bool
-QtGLVideoItem::itemInitialized()
+bool QtGLVideoItem::itemInitialized()
 {
   return m_openGlContextInitialized;
 }
@@ -195,6 +193,7 @@ QtGLVideoItem::itemInitialized()
 QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
                                         UpdatePaintNodeData* updatePaintNodeData)
 {
+  (void)updatePaintNodeData;
   if (!m_openGlContextInitialized) {
     return oldNode;
   }
@@ -203,18 +202,19 @@ QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
   GstVideoRectangle src, dst, result;
   GstQSGTexture *tex;
 
-  g_mutex_lock(&this->priv->lock);
-  if (!this->priv->caps) {
-      this->priv->waiting_on_render = false;
-      g_mutex_unlock(&this->priv->lock);
+  auto p = priv;
+  std::lock_guard lock { p->lock };
+  if (!p->caps) {
+      p->waiting_on_render = false;
       return NULL;
   }
 
-  g_mutex_lock(&this->priv->buffer_lock);
-  std::swap(this->priv->front_buffer, this->priv->back_buffer);
-  g_mutex_unlock(&this->priv->buffer_lock);
+  {
+    std::lock_guard buffer_lock { p->buffer_lock };
+    std::swap(p->front_buffer, p->back_buffer);
+  }
 
-  gst_gl_context_activate(this->priv->other_context, TRUE);
+  gst_gl_context_activate(p->other_context, TRUE);
   if (!texNode) {
     texNode = new QSGSimpleTextureNode();
     texNode->setOwnsTexture(true);
@@ -222,13 +222,13 @@ QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
   }
 
   tex = static_cast<GstQSGTexture*>(texNode->texture());
-  tex->setCaps(this->priv->caps);
-  tex->setBuffer(this->priv->front_buffer);
+  tex->setCaps(p->caps);
+  tex->setBuffer(p->front_buffer);
   texNode->markDirty(QSGNode::DirtyMaterial);
 
-  if (this->priv->force_aspect_ratio) {
-    src.w = this->priv->display_width;
-    src.h = this->priv->display_height;
+  if (p->force_aspect_ratio) {
+    src.w = p->display_width;
+    src.h = p->display_height;
 
     dst.x = boundingRect().x();
     dst.y = boundingRect().y();
@@ -245,25 +245,22 @@ QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
 
   texNode->setRect(QRectF(result.x, result.y, result.w, result.h));
 
-  gst_gl_context_activate(this->priv->other_context, FALSE);
-  this->priv->waiting_on_render = false;
-  g_mutex_unlock(&this->priv->lock);
-
+  gst_gl_context_activate(p->other_context, FALSE);
+  p->waiting_on_render = false;
   return texNode;
 }
 
-static void _reset(QtGLVideoItem * qt_item)
+static void _reset(QtGLVideoItemPrivate* priv)
 {
-  g_mutex_lock(&qt_item->priv->buffer_lock);
-  gst_buffer_replace(&qt_item->priv->back_buffer, NULL);
-  gst_buffer_replace(&qt_item->priv->front_buffer, NULL);
-  g_mutex_unlock(&qt_item->priv->buffer_lock);
-
-  gst_caps_replace(&qt_item->priv->caps, NULL);
-
-  qt_item->priv->negotiated = FALSE;
-  qt_item->priv->initted = FALSE;
-  qt_item->priv->waiting_on_render = FALSE;
+  {
+    std::lock_guard buffer_lock { priv->buffer_lock };
+    gst_buffer_replace(&priv->back_buffer, NULL);
+    gst_buffer_replace(&priv->front_buffer, NULL);
+  }
+  gst_caps_replace(&priv->caps, NULL);
+  priv->negotiated = FALSE;
+  priv->initted = FALSE;
+  priv->waiting_on_render = FALSE;
 }
 
 QtGLVideoItemInterface::~QtGLVideoItemInterface()
@@ -275,9 +272,10 @@ void QtGLVideoItemInterface::invalidateRef()
 {
   QMutexLocker locker(&lock);
   if (qt_item) {
-    g_mutex_lock(&qt_item->priv->lock);
-    _reset(qt_item);
-    g_mutex_unlock(&qt_item->priv->lock);
+    if (auto p = qt_item->priv) {
+      std::lock_guard lock { p->lock };
+      _reset(p.get());
+    }
     qt_item = nullptr;
   }
 }
@@ -285,33 +283,35 @@ void QtGLVideoItemInterface::invalidateRef()
 void QtGLVideoItemInterface::setBuffer(GstBuffer * buffer)
 {
   QMutexLocker locker(&lock);
-
   if (qt_item == NULL)
     return;
 
-  if (!qt_item->priv->negotiated) {
-    GST_WARNING ("Got buffer on unnegotiated QtGLVideoItem. Dropping");
+  auto p = qt_item->priv;
+  if (!p) {
+    GST_WARNING("QtGLVideoItemInterface destroyed, dropping");
+    return;
+  }
+  if (!p->negotiated) {
+    GST_WARNING("Got buffer on unnegotiated QtGLVideoItem. Dropping");
     return;
   }
 
-  g_mutex_lock(&qt_item->priv->buffer_lock);
-  gst_buffer_replace(&qt_item->priv->back_buffer, buffer);
-  qt_item->priv->waiting_on_render = true;
-  g_mutex_unlock(&qt_item->priv->buffer_lock);
+  {
+    std::lock_guard lock { p->buffer_lock };
+    gst_buffer_replace(&p->back_buffer, buffer);
+    p->waiting_on_render = true;
+  }
 
   // queue buffer and wait until it finishes rendering
   // this wait is important when our device is too slow to render and decode frames
   // so that the pipeline can use its queue element to drop frames as required
   QMetaObject::invokeMethod(qt_item, "update", Qt::BlockingQueuedConnection);
 
-  // unlock to allow pipeline to be modified while we wait on rendering
-  locker.unlock();
-
   // wait up to 100ms for the rendering to finish
   auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
-  while (qt_item->priv->waiting_on_render) {
+  while (p->waiting_on_render) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    if (qt_item->priv->waiting_on_render && std::chrono::steady_clock::now() > until) {
+    if (p->waiting_on_render && std::chrono::steady_clock::now() > until) {
       GST_WARNING ("Timed out waiting for rendering to finish");
       break;
     }
@@ -333,11 +333,12 @@ QtGLVideoItem::onSceneGraphInitialized ()
   GST_DEBUG ("scene graph initialization with Qt GL context %p",
       this->window()->openglContext ());
 
-  if (this->priv->qt_context == this->window()->openglContext ())
+  auto p = priv;
+  if (p->qt_context == this->window()->openglContext ())
     return;
 
-  this->priv->qt_context = this->window()->openglContext ();
-  if (this->priv->qt_context == NULL) {
+  p->qt_context = this->window()->openglContext ();
+  if (p->qt_context == NULL) {
     g_assert_not_reached ();
     return;
   }
@@ -353,8 +354,8 @@ QtGLVideoItem::onSceneGraphInitialized ()
   }
 #endif
 
-  m_openGlContextInitialized = gst_qt_get_gl_wrapcontext (this->priv->display,
-      &this->priv->other_context, &this->priv->context, wgl_device);
+  m_openGlContextInitialized = gst_qt_get_gl_wrapcontext (p->display,
+      &p->other_context, &p->context, wgl_device);
 
 #if GST_GL_HAVE_WINDOW_WIN32 && GST_GL_HAVE_PLATFORM_WGL && defined (HAVE_QT_WIN32) && defined (HAVE_QT_QPA_HEADER)
   if (wgl_device != nullptr) {
@@ -384,48 +385,35 @@ QtGLVideoItemInterface::initWinSys ()
   QMutexLocker locker(&lock);
 
   GError *error = NULL;
-
   if (qt_item == NULL)
     return FALSE;
+  auto p = qt_item->priv;
+  if (!p) return FALSE;
 
-  g_mutex_lock (&qt_item->priv->lock);
-
-  if (qt_item->priv->display && qt_item->priv->qt_context
-      && qt_item->priv->other_context && qt_item->priv->context) {
-    /* already have the necessary state */
-    g_mutex_unlock (&qt_item->priv->lock);
-    return TRUE;
+  std::lock_guard lock { p->lock };
+  if (p->display && p->qt_context && p->other_context && p->context) {
+    return TRUE; /* already have the necessary state */
   }
 
-  if (!GST_IS_GL_DISPLAY (qt_item->priv->display)) {
-    GST_ERROR ("%p failed to retrieve display connection %" GST_PTR_FORMAT,
-        qt_item, qt_item->priv->display);
-    g_mutex_unlock (&qt_item->priv->lock);
+  if (!GST_IS_GL_DISPLAY (p->display)) {
+    GST_ERROR("%p failed to retrieve display connection %" GST_PTR_FORMAT, qt_item, p->display);
     return FALSE;
   }
 
-  if (!GST_IS_GL_CONTEXT (qt_item->priv->other_context)) {
-    GST_ERROR ("%p failed to retrieve wrapped context %" GST_PTR_FORMAT, qt_item,
-        qt_item->priv->other_context);
-    g_mutex_unlock (&qt_item->priv->lock);
+  if (!GST_IS_GL_CONTEXT (p->other_context)) {
+    GST_ERROR("%p failed to retrieve wrapped context %" GST_PTR_FORMAT, qt_item, p->other_context);
     return FALSE;
   }
 
-  qt_item->priv->context = gst_gl_context_new (qt_item->priv->display);
-
-  if (!qt_item->priv->context) {
-    g_mutex_unlock (&qt_item->priv->lock);
+  p->context = gst_gl_context_new(p->display);
+  if (!p->context) {
     return FALSE;
   }
 
-  if (!gst_gl_context_create (qt_item->priv->context, qt_item->priv->other_context,
-        &error)) {
-    GST_ERROR ("%s", error->message);
-    g_mutex_unlock (&qt_item->priv->lock);
+  if (!gst_gl_context_create(p->context, p->other_context, &error)) {
+    GST_ERROR("%s", error->message);
     return FALSE;
   }
-
-  g_mutex_unlock (&qt_item->priv->lock);
   return TRUE;
 }
 
@@ -444,8 +432,7 @@ QtGLVideoItem::handleWindowChanged(QQuickWindow *win)
   }
 }
 
-static gboolean
-_calculate_par (QtGLVideoItem * widget, GstVideoInfo * info)
+static gboolean _calculate_par(QtGLVideoItemPrivate* priv, GstVideoInfo * info)
 {
   gboolean ok;
   gint width, height;
@@ -463,9 +450,9 @@ _calculate_par (QtGLVideoItem * widget, GstVideoInfo * info)
     par_n = 1;
 
   /* get display's PAR */
-  if (widget->priv->par_n != 0 && widget->priv->par_d != 0) {
-    display_par_n = widget->priv->par_n;
-    display_par_d = widget->priv->par_d;
+  if (priv->par_n != 0 && priv->par_d != 0) {
+    display_par_n = priv->par_n;
+    display_par_d = priv->par_d;
   } else {
     display_par_n = 1;
     display_par_d = 1;
@@ -482,24 +469,23 @@ _calculate_par (QtGLVideoItem * widget, GstVideoInfo * info)
 
   if (height % display_ratio_den == 0) {
     GST_DEBUG ("keeping video height");
-    widget->priv->display_width = (guint)
+    priv->display_width = (guint)
         gst_util_uint64_scale_int (height, display_ratio_num,
         display_ratio_den);
-    widget->priv->display_height = height;
+    priv->display_height = height;
   } else if (width % display_ratio_num == 0) {
     GST_DEBUG ("keeping video width");
-    widget->priv->display_width = width;
-    widget->priv->display_height = (guint)
+    priv->display_width = width;
+    priv->display_height = (guint)
         gst_util_uint64_scale_int (width, display_ratio_den, display_ratio_num);
   } else {
     GST_DEBUG ("approximating while keeping video height");
-    widget->priv->display_width = (guint)
+    priv->display_width = (guint)
         gst_util_uint64_scale_int (height, display_ratio_num,
         display_ratio_den);
-    widget->priv->display_height = height;
+    priv->display_height = height;
   }
-  GST_DEBUG ("scaling to %dx%d", widget->priv->display_width,
-      widget->priv->display_height);
+  GST_DEBUG ("scaling to %dx%d", priv->display_width, priv->display_height);
 
   return TRUE;
 }
@@ -516,97 +502,75 @@ QtGLVideoItemInterface::setCaps (GstCaps * caps)
   if (qt_item == NULL)
     return FALSE;
 
-  if (qt_item->priv->caps && gst_caps_is_equal_fixed (qt_item->priv->caps, caps))
+  auto p = qt_item->priv;
+  if (!p)
+    return FALSE;
+  if (p->caps && gst_caps_is_equal_fixed(p->caps, caps))
     return TRUE;
 
-  if (!gst_video_info_from_caps (&v_info, caps))
+  if (!gst_video_info_from_caps(&v_info, caps))
     return FALSE;
 
-  g_mutex_lock (&qt_item->priv->lock);
-
-  _reset (qt_item);
-
-  gst_caps_replace (&qt_item->priv->caps, caps);
-
-  if (!_calculate_par (qt_item, &v_info)) {
-    g_mutex_unlock (&qt_item->priv->lock);
+  std::lock_guard lock { p->lock };
+  _reset(p.get());
+  gst_caps_replace(&p->caps, caps);
+  if (!_calculate_par(p.get(), &v_info)) {
     return FALSE;
   }
-
-  qt_item->priv->v_info = v_info;
-  qt_item->priv->negotiated = TRUE;
-
-  g_mutex_unlock (&qt_item->priv->lock);
-
+  p->v_info = v_info;
+  p->negotiated = TRUE;
   return TRUE;
 }
 
-GstGLContext *
-QtGLVideoItemInterface::getQtContext ()
+GstGLContext* QtGLVideoItemInterface::getQtContext()
 {
   QMutexLocker locker(&lock);
-
-  if (!qt_item || !qt_item->priv->other_context)
-    return NULL;
-
-  return (GstGLContext *) gst_object_ref (qt_item->priv->other_context);
+  if (!qt_item) return NULL;
+  auto p = qt_item->priv;
+  if (!p || !p->other_context) return NULL;
+  return (GstGLContext*)gst_object_ref(p->other_context);
 }
 
-GstGLContext *
-QtGLVideoItemInterface::getContext ()
+GstGLContext* QtGLVideoItemInterface::getContext()
 {
   QMutexLocker locker(&lock);
-
-  if (!qt_item || !qt_item->priv->context)
-    return NULL;
-
-  return (GstGLContext *) gst_object_ref (qt_item->priv->context);
+  if (!qt_item) return NULL;
+  auto p = qt_item->priv;
+  if (!p || !p->context) return NULL;
+  return (GstGLContext*)gst_object_ref(p->context);
 }
 
-GstGLDisplay *
-QtGLVideoItemInterface::getDisplay() 
+GstGLDisplay* QtGLVideoItemInterface::getDisplay()
 {
   QMutexLocker locker(&lock);
-
-  if (!qt_item || !qt_item->priv->display)
-    return NULL;
-
-  return (GstGLDisplay *) gst_object_ref (qt_item->priv->display);
+  if (!qt_item) return NULL;
+  auto p = qt_item->priv;
+  if (!p || !p->display) return NULL;
+  return (GstGLDisplay*)gst_object_ref(p->display);
 }
 
-void
-QtGLVideoItemInterface::setDAR(gint num, gint den)
+void QtGLVideoItemInterface::setDAR(gint num, gint den)
 {
   QMutexLocker locker(&lock);
-  if (!qt_item)
-    return;
-  qt_item->setDAR(num, den);
+  if (qt_item) qt_item->setDAR(num, den);
 }
 
-void
-QtGLVideoItemInterface::getDAR(gint * num, gint * den)
+void QtGLVideoItemInterface::getDAR(gint * num, gint * den)
 {
   QMutexLocker locker(&lock);
-  if (!qt_item)
-    return;
-  qt_item->getDAR (num, den);
+  if (qt_item) qt_item->getDAR(num, den);
 }
 
-void
-QtGLVideoItemInterface::setForceAspectRatio(bool force_aspect_ratio)
+void QtGLVideoItemInterface::setForceAspectRatio(bool force_aspect_ratio)
 {
   QMutexLocker locker(&lock);
-  if (!qt_item)
-    return;
-  qt_item->setForceAspectRatio(force_aspect_ratio);
+  if (qt_item) qt_item->setForceAspectRatio(force_aspect_ratio);
 }
 
-bool
-QtGLVideoItemInterface::getForceAspectRatio()
+bool QtGLVideoItemInterface::getForceAspectRatio()
 {
   QMutexLocker locker(&lock);
-  if (!qt_item)
-    return FALSE;
+  if (!qt_item) return FALSE;
   return qt_item->getForceAspectRatio();
 }
 

@@ -80,10 +80,13 @@ public:
     bool getForceAspectRatio();
     bool itemInitialized();
 
-    QSharedPointer<QtGLVideoItemInterface> getInterface() { return proxy; };
+    const QSharedPointer<QtGLVideoItemInterface>& getInterface() { return proxy; };
+private:
+    friend class QtGLVideoItemInterface;
     /* private for C interface ... */
-    QtGLVideoItemPrivate *priv;
+    QSharedPointer<QtGLVideoItemPrivate> priv;
 
+public:
 Q_SIGNALS:
     void itemInitializedChanged();
 

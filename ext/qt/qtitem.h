@@ -38,7 +38,8 @@ class QtGLVideoItemInterface : public QObject
 {
     Q_OBJECT
 public:
-    QtGLVideoItemInterface (QtGLVideoItem *w) : qt_item (w), lock() {};
+    QtGLVideoItemInterface(QtGLVideoItem *w) : qt_item (w), lock() {};
+    ~QtGLVideoItemInterface();
 
     void invalidateRef();
 

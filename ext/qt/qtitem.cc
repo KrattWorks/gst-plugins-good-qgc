@@ -144,17 +144,17 @@ QtGLVideoItem::~QtGLVideoItem()
    * any ongoing calls are done by invalidating the proxy
    * pointer */
   GST_INFO ("Destroying QtGLVideoItem and invalidating the proxy");
-  proxy->invalidateRef();
-  proxy.clear();
+  proxy.clear(); // call QtGLVideoItemInterface destructor
 
-  g_mutex_clear (&this->priv->lock);
+  g_mutex_clear(&this->priv->lock);
+  g_mutex_clear(&this->priv->buffer_lock);
   if (this->priv->context)
     gst_object_unref(this->priv->context);
   if (this->priv->other_context)
     gst_object_unref(this->priv->other_context);
   if (this->priv->display)
     gst_object_unref(this->priv->display);
-  g_free (this->priv);
+  g_free(this->priv);
   this->priv = NULL;
 }
 
@@ -205,6 +205,7 @@ QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
 
   g_mutex_lock(&this->priv->lock);
   if (!this->priv->caps) {
+      this->priv->waiting_on_render = false;
       g_mutex_unlock(&this->priv->lock);
       return NULL;
   }
@@ -253,14 +254,32 @@ QSGNode* QtGLVideoItem::updatePaintNode(QSGNode* oldNode,
 
 static void _reset(QtGLVideoItem * qt_item)
 {
+  g_mutex_lock(&qt_item->priv->buffer_lock);
   gst_buffer_replace(&qt_item->priv->back_buffer, NULL);
   gst_buffer_replace(&qt_item->priv->front_buffer, NULL);
+  g_mutex_unlock(&qt_item->priv->buffer_lock);
 
   gst_caps_replace(&qt_item->priv->caps, NULL);
 
   qt_item->priv->negotiated = FALSE;
   qt_item->priv->initted = FALSE;
   qt_item->priv->waiting_on_render = FALSE;
+}
+
+QtGLVideoItemInterface::~QtGLVideoItemInterface()
+{
+  invalidateRef();
+}
+
+void QtGLVideoItemInterface::invalidateRef()
+{
+  QMutexLocker locker(&lock);
+  if (qt_item) {
+    g_mutex_lock(&qt_item->priv->lock);
+    _reset(qt_item);
+    g_mutex_unlock(&qt_item->priv->lock);
+    qt_item = nullptr;
+  }
 }
 
 void QtGLVideoItemInterface::setBuffer(GstBuffer * buffer)
@@ -285,8 +304,17 @@ void QtGLVideoItemInterface::setBuffer(GstBuffer * buffer)
   // so that the pipeline can use its queue element to drop frames as required
   QMetaObject::invokeMethod(qt_item, "update", Qt::BlockingQueuedConnection);
 
+  // unlock to allow pipeline to be modified while we wait on rendering
+  locker.unlock();
+
+  // wait up to 100ms for the rendering to finish
+  auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
   while (qt_item->priv->waiting_on_render) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    if (qt_item->priv->waiting_on_render && std::chrono::steady_clock::now() > until) {
+      GST_WARNING ("Timed out waiting for rendering to finish");
+      break;
+    }
   }
 }
 
@@ -580,12 +608,5 @@ QtGLVideoItemInterface::getForceAspectRatio()
   if (!qt_item)
     return FALSE;
   return qt_item->getForceAspectRatio();
-}
-
-void
-QtGLVideoItemInterface::invalidateRef()
-{
-  QMutexLocker locker(&lock);
-  qt_item = NULL;
 }
 
